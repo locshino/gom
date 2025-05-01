@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "cobra@v1.8.0": "github.com/spf13/cobra@v1.8.0"
+  },
+  "environments": {
+      "PORT": {
+          "default": "8080",
+          "description": "Port the server listens on"
+      }
+  }
+}

@@ -1,5 +1,5 @@
 // gomfile.go
-// Manages the project-local gom.json file for dependency aliases.
+// Manages the project-local gom.json file (aliases and environment info).
 package main
 
 import (
@@ -13,204 +13,163 @@ import (
 
 // gomFileName is defined in config.go
 
+// EnvironmentInfo holds details about a configured environment variable.
+type EnvironmentInfo struct {
+	Default     string `json:"default,omitempty"` // Optional default value.
+	Description string `json:"description"`       // Required description.
+}
+
 // GomFile represents the structure of the gom.json file.
 type GomFile struct {
-	Dependencies map[string]string `json:"dependencies"` // Map: alias@version -> import_path
-	filePath     string            // Absolute path to the gom.json file.
-	mu           sync.RWMutex      // Protects concurrent access to Dependencies map.
+	// Dependency aliases: alias@version -> import_path
+	Dependencies map[string]string `json:"dependencies,omitempty"`
+	// Environment variable documentation: VAR_NAME -> EnvironmentInfo
+	Environments map[string]EnvironmentInfo `json:"environments,omitempty"`
+	filePath     string                     // Absolute path to the gom.json file.
+	mu           sync.RWMutex               // Protects concurrent access.
 }
 
 // projectGomFile holds the loaded gom.json data for the current project.
-// It's initialized by initProjectGomFile.
 var projectGomFile *GomFile
 
-// findProjectRoot searches upwards from the current directory for a go.mod file.
-//
-// It iterates up the directory tree until go.mod is found or the root is reached.
-// Returns the absolute path to the directory containing go.mod.
-// Returns an error if go.mod is not found or if there's a filesystem error.
+// findProjectRoot searches upwards for go.mod.
 func findProjectRoot() (string, error) {
 	currentDir, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("could not get current working directory: %w", err)
-	}
-
+	if err != nil { return "", fmt.Errorf("could not get current working directory: %w", err) }
 	dir := currentDir
 	for {
 		goModPath := filepath.Join(dir, "go.mod")
-		if _, err := os.Stat(goModPath); err == nil {
-			return dir, nil // Found.
-		} else if !errors.Is(err, os.ErrNotExist) {
-			// Filesystem error other than "not found".
-			return "", fmt.Errorf("error checking for go.mod in '%s': %w", dir, err)
-		}
-
-		// Move up.
+		if _, err := os.Stat(goModPath); err == nil { return dir, nil } // Found.
+		if !errors.Is(err, os.ErrNotExist) { return "", fmt.Errorf("error checking for go.mod in '%s': %w", dir, err) }
 		parentDir := filepath.Dir(dir)
-		if parentDir == dir {
-			// Reached root.
-			return "", fmt.Errorf("could not find go.mod in the current directory or any parent directory. Please run 'gom init' or 'gom' commands inside a Go module")
-		}
+		if parentDir == dir { return "", fmt.Errorf("could not find go.mod. Please run 'gom' commands inside a Go module") }
 		dir = parentDir
 	}
 }
 
-// initProjectGomFile loads the gom.json file from the specified project root.
-//
-// It reads the file if it exists and unmarshals the JSON data into the global
-// projectGomFile variable. If the file doesn't exist, it initializes an empty
-// projectGomFile. It handles potential JSON parsing errors.
-// Assumes projectRoot is a valid directory path.
-// Returns an error only if the file exists but is unreadable or contains invalid JSON.
+// initProjectGomFile loads gom.json from the project root.
+// Initializes an empty struct if the file doesn't exist.
 func initProjectGomFile(projectRoot string) error {
 	gomFilePath := filepath.Join(projectRoot, gomFileName)
-	projectGomFile = &GomFile{
+	projectGomFile = &GomFile{ // Initialize maps immediately
 		Dependencies: make(map[string]string),
+		Environments: make(map[string]EnvironmentInfo),
 		filePath:     gomFilePath,
 	}
 
-	// Read file content.
 	data, err := os.ReadFile(gomFilePath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil // File not existing is okay.
-		}
+		if errors.Is(err, os.ErrNotExist) { return nil } // File not existing is okay.
 		return fmt.Errorf("could not read existing '%s' file at '%s': %w", gomFileName, gomFilePath, err)
 	}
 
-	// Parse JSON data.
-	projectGomFile.mu.Lock() // Lock for writing to the struct.
+	projectGomFile.mu.Lock()
 	defer projectGomFile.mu.Unlock()
-
 	if err := json.Unmarshal(data, &projectGomFile); err != nil {
 		fmt.Printf("Warning: Could not parse existing '%s' file at '%s'. Error: %v\n", gomFileName, gomFilePath, err)
-		projectGomFile.Dependencies = make(map[string]string) // Reset on error.
-		return fmt.Errorf("invalid JSON format in '%s'", gomFilePath) // Indicate bad format.
+		// Reset maps on parse error.
+		projectGomFile.Dependencies = make(map[string]string)
+		projectGomFile.Environments = make(map[string]EnvironmentInfo)
+		return fmt.Errorf("invalid JSON format in '%s'", gomFilePath)
 	}
 
-	// Ensure map is initialized.
-	if projectGomFile.Dependencies == nil {
-		projectGomFile.Dependencies = make(map[string]string)
-	}
+	// Ensure maps are initialized after unmarshaling (if JSON had null).
+	if projectGomFile.Dependencies == nil { projectGomFile.Dependencies = make(map[string]string) }
+	if projectGomFile.Environments == nil { projectGomFile.Environments = make(map[string]EnvironmentInfo) }
 	return nil
 }
 
-// saveProjectGomFile writes the current in-memory dependency data to the project's gom.json file.
-//
-// It marshals the projectGomFile.Dependencies map into JSON format and writes it
-// to the filePath stored in projectGomFile. It handles file writing errors.
-// Does nothing if projectGomFile or its filePath is not set (e.g., outside a project).
+// saveProjectGomFile writes the current data to the project's gom.json file.
 func saveProjectGomFile() error {
-	if projectGomFile == nil || projectGomFile.filePath == "" {
-		return nil // Nothing to save.
-	}
+	if projectGomFile == nil || projectGomFile.filePath == "" { return nil } // Nothing to save.
 
-	projectGomFile.mu.RLock() // Read lock for accessing Dependencies.
-	saveData := map[string]interface{}{"dependencies": projectGomFile.Dependencies}
-	data, err := json.MarshalIndent(saveData, "", "  ")
+	projectGomFile.mu.RLock()
+	// Marshal the entire GomFile struct.
+	data, err := json.MarshalIndent(projectGomFile, "", "  ")
 	projectGomFile.mu.RUnlock()
+	if err != nil { return fmt.Errorf("could not marshal project data to JSON: %w", err) }
 
-	if err != nil {
-		return fmt.Errorf("could not marshal project dependencies to JSON: %w", err)
-	}
-
-	projectGomFile.mu.Lock() // Lock for writing file.
+	projectGomFile.mu.Lock()
 	defer projectGomFile.mu.Unlock()
-
-	// Write file (permissions 0644: rw-r--r--).
-	if err := os.WriteFile(projectGomFile.filePath, data, 0644); err != nil {
+	if err := os.WriteFile(projectGomFile.filePath, data, 0644); err != nil { // Perms 0644: rw-r--r--.
 		return fmt.Errorf("could not write to project '%s' file at '%s': %w", gomFileName, projectGomFile.filePath, err)
 	}
 	return nil
 }
 
-// addProjectDependency adds or updates a dependency alias in the in-memory projectGomFile.
-//
-// It takes the alias key (e.g., "name@version") and the import path.
-// It ensures the internal map exists and updates the entry.
-// Returns an error if projectGomFile is not initialized.
-// Note: This function does not save the changes to disk.
-func addProjectDependency(aliasVersion, importPath string) error {
-    if projectGomFile == nil {
-        return fmt.Errorf("internal error: projectGomFile not initialized before adding dependency")
-    }
-	projectGomFile.mu.Lock() // Lock for writing to map.
-	defer projectGomFile.mu.Unlock()
+// --- Dependency Alias Management ---
 
-	if projectGomFile.Dependencies == nil { // Should be initialized, but double-check.
-		projectGomFile.Dependencies = make(map[string]string)
-	}
+func addProjectDependency(aliasVersion, importPath string) error {
+    if projectGomFile == nil { return fmt.Errorf("internal error: projectGomFile not initialized") }
+	projectGomFile.mu.Lock()
+	defer projectGomFile.mu.Unlock()
+	if projectGomFile.Dependencies == nil { projectGomFile.Dependencies = make(map[string]string) }
 	projectGomFile.Dependencies[aliasVersion] = importPath
 	return nil
 }
 
-// removeProjectDependency removes a dependency alias from the in-memory projectGomFile.
-//
-// It takes the alias key (e.g., "name@version").
-// Returns true if the key existed and was removed, false otherwise.
-// Returns an error if projectGomFile is not initialized.
-// Note: This function does not save the changes to disk.
 func removeProjectDependency(aliasVersion string) (bool, error) {
-    if projectGomFile == nil {
-        return false, fmt.Errorf("internal error: projectGomFile not initialized before removing dependency")
-    }
-    projectGomFile.mu.Lock() // Lock for writing to map.
+    if projectGomFile == nil { return false, fmt.Errorf("internal error: projectGomFile not initialized") }
+    projectGomFile.mu.Lock()
     defer projectGomFile.mu.Unlock()
-
-    if projectGomFile.Dependencies == nil {
-        return false, nil // Key doesn't exist.
-    }
-
+    if projectGomFile.Dependencies == nil { return false, nil } // Not found if map nil.
     _, exists := projectGomFile.Dependencies[aliasVersion]
-    if exists {
-        delete(projectGomFile.Dependencies, aliasVersion)
-        return true, nil // Removed successfully.
-    }
-    return false, nil // Key didn't exist.
+    if exists { delete(projectGomFile.Dependencies, aliasVersion); return true, nil }
+    return false, nil // Not found.
 }
 
-
-// getProjectDependency retrieves the import path for a specific alias@version from the project data.
-//
-// Returns the path and true if found, otherwise empty string and false.
-// Returns false if projectGomFile is not initialized or the alias is not found.
 func getProjectDependency(aliasVersion string) (string, bool) {
-    if projectGomFile == nil {
-        return "", false
-    }
-	projectGomFile.mu.RLock() // Read lock.
+    if projectGomFile == nil { return "", false }
+	projectGomFile.mu.RLock()
 	defer projectGomFile.mu.RUnlock()
-
-    if projectGomFile.Dependencies == nil {
-        return "", false
-    }
+    if projectGomFile.Dependencies == nil { return "", false }
 	path, found := projectGomFile.Dependencies[aliasVersion]
-	return path, found && path != "" // Consider empty path as not found.
+	return path, found && path != ""
 }
 
-// getAllProjectDependencies returns a copy of the current project dependencies map.
-//
-// Returns a copy to prevent external modification of the internal map.
-// Returns an error if projectGomFile is not initialized or if not inside a Go project.
 func getAllProjectDependencies() (map[string]string, error) {
-    if projectGomFile == nil {
-         return nil, fmt.Errorf("internal error: projectGomFile not initialized before getting all dependencies")
-    }
-     if projectGomFile.filePath == "" {
-        // Not inside a Go project context.
-        return nil, fmt.Errorf("cannot list dependencies: not inside a Go project (go.mod not found)")
-    }
-
-    projectGomFile.mu.RLock() // Read lock.
+    if projectGomFile == nil { return nil, fmt.Errorf("internal error: projectGomFile not initialized") }
+    if projectGomFile.filePath == "" { return nil, fmt.Errorf("cannot list dependencies: not inside a Go project") }
+    projectGomFile.mu.RLock()
     defer projectGomFile.mu.RUnlock()
-
-    if projectGomFile.Dependencies == nil {
-         return make(map[string]string), nil // Return empty map.
-    }
-    // Create and return a copy.
+    if projectGomFile.Dependencies == nil { return make(map[string]string), nil }
     depsCopy := make(map[string]string, len(projectGomFile.Dependencies))
-    for k, v := range projectGomFile.Dependencies {
-        depsCopy[k] = v
-    }
+    for k, v := range projectGomFile.Dependencies { depsCopy[k] = v }
     return depsCopy, nil
+}
+
+// --- Environment Variable Management ---
+
+// addProjectEnvironment adds or updates an environment variable's info in gom.json.
+func addProjectEnvironment(name string, info EnvironmentInfo) error {
+	if projectGomFile == nil { return fmt.Errorf("internal error: projectGomFile not initialized") }
+	projectGomFile.mu.Lock()
+	defer projectGomFile.mu.Unlock()
+	if projectGomFile.Environments == nil { projectGomFile.Environments = make(map[string]EnvironmentInfo) }
+	projectGomFile.Environments[name] = info
+	return nil
+}
+
+// removeProjectEnvironment removes an environment variable's info from gom.json.
+// Returns true if removed, false if not found.
+func removeProjectEnvironment(name string) (bool, error) {
+	if projectGomFile == nil { return false, fmt.Errorf("internal error: projectGomFile not initialized") }
+	projectGomFile.mu.Lock()
+	defer projectGomFile.mu.Unlock()
+	if projectGomFile.Environments == nil { return false, nil } // Not found.
+	_, exists := projectGomFile.Environments[name]
+	if exists { delete(projectGomFile.Environments, name); return true, nil }
+	return false, nil // Not found.
+}
+
+// getAllProjectEnvironments returns a copy of the environments map.
+func getAllProjectEnvironments() (map[string]EnvironmentInfo, error) {
+	if projectGomFile == nil { return nil, fmt.Errorf("internal error: projectGomFile not initialized") }
+	if projectGomFile.filePath == "" { return nil, fmt.Errorf("cannot list environments: not inside a Go project") }
+	projectGomFile.mu.RLock()
+	defer projectGomFile.mu.RUnlock()
+	if projectGomFile.Environments == nil { return make(map[string]EnvironmentInfo), nil }
+	envsCopy := make(map[string]EnvironmentInfo, len(projectGomFile.Environments))
+	for k, v := range projectGomFile.Environments { envsCopy[k] = v }
+	return envsCopy, nil
 }

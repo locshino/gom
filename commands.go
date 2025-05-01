@@ -12,79 +12,56 @@ import (
 	"strings"
 )
 
-// --- Command Handlers ---
+// --- Init Handler ---
 
 // handleInit creates an empty gom.json file in the current directory.
-//
-// It checks if gom.json already exists. If not, it creates a new one
-// with an empty "dependencies" map.
-// Returns an error if file checking or creation fails.
 func handleInit(args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("the 'init' command does not take any arguments")
-	}
-
+	if len(args) > 0 { return fmt.Errorf("the 'init' command does not take any arguments") }
 	currentDir, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("could not get current working directory: %w", err)
-	}
+	if err != nil { return fmt.Errorf("could not get current working directory: %w", err) }
 	gomFilePath := filepath.Join(currentDir, gomFileName)
-
-	// Check if file already exists.
 	if _, err := os.Stat(gomFilePath); err == nil {
 		fmt.Printf("'%s' already exists in this directory.\n", gomFileName)
-		return nil // Nothing to do.
+		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("error checking for existing '%s': %w", gomFileName, err)
 	}
-
-	// Create and save an empty gom.json.
 	initialGomFile := &GomFile{
 		Dependencies: make(map[string]string),
+		Environments: make(map[string]EnvironmentInfo), // Also init environments
 		filePath:     gomFilePath,
 	}
-	projectGomFile = initialGomFile // Temporarily set global for saving.
-	err = saveProjectGomFile()      // Save the empty file.
-	if err != nil {
+	projectGomFile = initialGomFile // Allow saving
+	if err = saveProjectGomFile(); err != nil {
 		return fmt.Errorf("failed to create '%s': %w", gomFileName, err)
 	}
-
 	fmt.Printf("Initialized empty '%s' in %s\n", gomFileName, currentDir)
 	return nil
 }
 
+// --- Dependency Alias Handlers ---
 
 // handleInstall installs dependencies based on aliases.
-//
-// If an alias@version argument is provided, it attempts to install that specific package.
-// It first checks the project's gom.json, then the global cache. If found in the
-// global cache, the alias is added to the project's gom.json. Finally, it runs `go get`
-// using the resolved import path.
-// If no argument is provided, it installs all dependencies listed in the project's gom.json.
-// Returns true if the project's gom.json was modified (due to adding from cache), and any error.
+// Returns (modifiedProjectGom bool, error).
 func handleInstall(args []string) (bool, error) {
     modifiedProjectGom := false
     if projectGomFile == nil || projectGomFile.filePath == "" {
          return modifiedProjectGom, fmt.Errorf("could not find '%s' or project root (go.mod). Run 'gom init' first?", gomFileName)
     }
-
-	if len(args) == 1 {
-		// Install specific package.
+	if len(args) == 1 { // Install specific alias
 		aliasVersion := args[0]
 		packageName, version := parsePackageArg(aliasVersion)
 		if packageName == "" || version == "" {
 			 return modifiedProjectGom, fmt.Errorf("invalid alias format: '%s'. Must be <name>@<version>", aliasVersion)
 		}
-
-		// Find import path: check project, then global cache.
 		importPath, found := getProjectDependency(aliasVersion)
-		if !found {
+		if !found { // Check global cache
 			fmt.Printf("-> Alias '%s' not found in project '%s', checking global cache...\n", aliasVersion, gomFileName)
 			importPath, found = getGlobalCachedPath(aliasVersion)
 			if !found {
 				return modifiedProjectGom, fmt.Errorf("alias '%s' not found in project '%s' or global cache. Use 'gom get <link> as %s [-g]' to define it first", aliasVersion, gomFileName, aliasVersion)
 			}
-			// Found in global, add to project.
+			// Found globally, add locally
 			fmt.Printf("-> Found '%s' in global cache: %s\n", aliasVersion, importPath)
 			if err := addProjectDependency(aliasVersion, importPath); err != nil {
 				return modifiedProjectGom, fmt.Errorf("internal error adding dependency from global cache to project '%s': %w", gomFileName, err)
@@ -92,28 +69,21 @@ func handleInstall(args []string) (bool, error) {
 			modifiedProjectGom = true
 			fmt.Printf("-> Added '%s' -> '%s' to project '%s'.\n", aliasVersion, importPath, gomFileName)
 		}
-
-		// Run go get.
+		// Install using resolved path
 		fmt.Printf("-> Installing '%s' using path: %s\n", aliasVersion, importPath)
 		fmt.Printf("-> Preparing to run: go get %s\n", importPath)
 		if err := runGoCommand("get", importPath); err != nil {
 			return modifiedProjectGom, fmt.Errorf("'go get %s' command failed", importPath)
 		}
 		fmt.Printf("\n-> Success! Installed/updated: %s\n", importPath)
-
-	} else if len(args) == 0 {
-		// Install all dependencies from project gom.json.
+	} else if len(args) == 0 { // Install all from project gom.json
 		fmt.Printf("-> Installing all dependencies listed in project '%s'...\n", gomFileName)
 		dependencies, err := getAllProjectDependencies()
-        if err != nil {
-            return modifiedProjectGom, err
-        }
+        if err != nil { return modifiedProjectGom, err }
 		if len(dependencies) == 0 {
 			fmt.Printf("No dependencies found in '%s'. Nothing to install.\n", gomFileName)
 			return modifiedProjectGom, nil
 		}
-
-		// Install each dependency.
 		installErrors := []string{}
 		successCount := 0
 		for aliasVersion, importPath := range dependencies {
@@ -122,12 +92,8 @@ func handleInstall(args []string) (bool, error) {
 				errorMsg := fmt.Sprintf("Failed to install %s (%s): %v", aliasVersion, importPath, err)
 				fmt.Fprintf(os.Stderr, "Error: %s\n", errorMsg)
 				installErrors = append(installErrors, errorMsg)
-			} else {
-				successCount++
-			}
+			} else { successCount++ }
 		}
-
-		// Report summary.
 		fmt.Println("--- Installation Summary ---")
 		fmt.Printf("Successfully installed/updated %d dependencies.\n", successCount)
 		if len(installErrors) > 0 {
@@ -135,73 +101,46 @@ func handleInstall(args []string) (bool, error) {
 			return modifiedProjectGom, fmt.Errorf("%d dependencies failed to install", len(installErrors))
 		}
 		fmt.Println("--------------------------")
-
 	} else {
 		return modifiedProjectGom, fmt.Errorf("the 'install' command takes zero or one argument ([<alias>@<version>])")
 	}
-
 	return modifiedProjectGom, nil
 }
 
-
 // handleGetAs installs a package via `go get` and saves an alias for it.
-//
-// Usage: gom get <link> as <name>@<version> [-g]
-// It runs `go get <link>`. On success, it saves the mapping
-// `<name>@<version>` -> `<link>` either to the project's gom.json (default)
-// or the global cache (if -g is specified).
-// Returns flags indicating which file (global cache, project gom.json) was modified, and any error.
+// Returns (modifiedGlobal bool, modifiedProject bool, error).
 func handleGetAs(args []string) (bool, bool, error) {
-    modifiedGlobal := false
-    modifiedProject := false
-
-	// Parse the optional -g flag.
+    modifiedGlobal := false; modifiedProject := false
 	getCmd := flag.NewFlagSet("get", flag.ContinueOnError)
-	globalFlag := getCmd.Bool("g", false, "Save alias to global cache instead of project's gom.json")
+	globalFlag := getCmd.Bool("g", false, "Save alias to global cache")
 	if err := getCmd.Parse(args); err != nil {
-		return false, false, fmt.Errorf("invalid flags for 'get' command. Usage: gom get <link> as <name>@<version> [-g]")
+		return false, false, fmt.Errorf("invalid flags. Usage: gom get <link> as <name>@<version> [-g]")
 	}
-
-	// Validate positional arguments.
 	positionalArgs := getCmd.Args()
 	if len(positionalArgs) != 3 || strings.ToLower(positionalArgs[1]) != "as" {
 		return false, false, fmt.Errorf("usage: gom get <dependency_link> as <name>@<version> [-g]")
 	}
-	dependencyLink := positionalArgs[0]
-	nameAndVersion := positionalArgs[2]
-
-	// Basic link validation (optional).
-	if !strings.Contains(dependencyLink, "/") {
-		fmt.Printf("Warning: Dependency link '%s' might not be a standard import path.\n", dependencyLink)
-	}
-
-	// Validate alias format (must include specific version).
+	dependencyLink := positionalArgs[0]; nameAndVersion := positionalArgs[2]
+	if !strings.Contains(dependencyLink, "/") { fmt.Printf("Warning: Link '%s' might not be standard.\n", dependencyLink) }
 	packageName, version := parsePackageArg(nameAndVersion)
 	if packageName == "" || version == "" || version == "latest" {
-		return false, false, fmt.Errorf("invalid alias format: '%s'. Must be <name>@<specific_version>", nameAndVersion)
+		return false, false, fmt.Errorf("invalid alias: '%s'. Must be <name>@<specific_version>", nameAndVersion)
 	}
-
-	// Run go get.
 	fmt.Printf("-> Preparing to run: go get %s\n", dependencyLink)
 	if err := runGoCommand("get", dependencyLink); err != nil {
 		return false, false, fmt.Errorf("'go get %s' command failed", dependencyLink)
 	}
 	fmt.Printf("\n-> 'go get %s' successful.\n", dependencyLink)
-
 	aliasVersionKey := fmt.Sprintf("%s@%s", packageName, version)
-
-	// Save the alias mapping.
-	if *globalFlag {
-		// Save to global cache.
+	if *globalFlag { // Save to global cache
 		if err := addGlobalCachedPath(aliasVersionKey, dependencyLink); err != nil {
 			return false, false, fmt.Errorf("failed to update global cache: %w", err)
 		}
 		modifiedGlobal = true
 		fmt.Printf("-> Updated global cache: Added alias '%s' -> '%s'\n", aliasVersionKey, dependencyLink)
-	} else {
-		// Save to project gom.json.
+	} else { // Save to project gom.json
         if projectGomFile == nil || projectGomFile.filePath == "" {
-             return false, false, fmt.Errorf("could not find '%s' or project root (go.mod). Run 'gom init' first to use project aliases?", gomFileName)
+             return false, false, fmt.Errorf("could not find '%s' or project root. Run 'gom init' first?", gomFileName)
         }
 		if err := addProjectDependency(aliasVersionKey, dependencyLink); err != nil {
 			return false, false, fmt.Errorf("failed to update project '%s': %w", gomFileName, err)
@@ -209,112 +148,151 @@ func handleGetAs(args []string) (bool, bool, error) {
 		modifiedProject = true
 		fmt.Printf("-> Updated project '%s': Added alias '%s' -> '%s'\n", gomFileName, aliasVersionKey, dependencyLink)
 	}
-
 	return modifiedGlobal, modifiedProject, nil
 }
 
+// handleUninstall removes an alias from the project's gom.json file.
+// Returns (modifiedProjectGom bool, error).
+func handleUninstall(args []string) (bool, error) {
+    modifiedProjectGom := false
+    if projectGomFile == nil || projectGomFile.filePath == "" {
+         return modifiedProjectGom, fmt.Errorf("could not find '%s' or project root. Run 'gom init' first?", gomFileName)
+    }
+	if len(args) != 1 { return modifiedProjectGom, fmt.Errorf("usage: gom uninstall <alias>@<version>") }
+	aliasVersion := args[0]
+	packageName, version := parsePackageArg(aliasVersion)
+	if packageName == "" || version == "" {
+		 return modifiedProjectGom, fmt.Errorf("invalid alias format: '%s'. Must be <name>@<version>", aliasVersion)
+	}
+	fmt.Printf("-> Removing alias '%s' from project '%s'...\n", aliasVersion, gomFileName)
+	removed, err := removeProjectDependency(aliasVersion)
+	if err != nil { return modifiedProjectGom, fmt.Errorf("internal error removing dependency: %w", err) }
+	if !removed { fmt.Printf("Alias '%s' not found in '%s'. Nothing to remove.\n", aliasVersion, gomFileName)
+	} else {
+		modifiedProjectGom = true
+		fmt.Printf("Successfully removed alias '%s' from '%s'.\n", aliasVersion, gomFileName)
+		fmt.Printf("Note: Run 'go mod tidy' manually if the package is no longer needed.\n")
+	}
+	return modifiedProjectGom, nil
+}
+
 // handleShow displays the contents of the project's gom.json file.
-//
-// It reads the dependencies from the initialized projectGomFile and prints them
-// as formatted JSON. Returns an error if the project context is missing or
-// if formatting fails.
 func handleShow(args []string) error {
     if projectGomFile == nil || projectGomFile.filePath == "" {
-        return fmt.Errorf("could not find '%s' or project root (go.mod). Run 'gom init' first?", gomFileName)
+        return fmt.Errorf("could not find '%s' or project root. Run 'gom init' first?", gomFileName)
     }
-	if len(args) > 0 {
-		return fmt.Errorf("the 'show' command does not take any arguments")
+	if len(args) > 0 { return fmt.Errorf("the 'show' command does not take any arguments") }
+	// Use MarshalIndent on the whole projectGomFile struct now
+	projectGomFile.mu.RLock()
+	jsonData, err := json.MarshalIndent(projectGomFile, "", "  ")
+	projectGomFile.mu.RUnlock()
+	if err != nil { return fmt.Errorf("failed to format project data for display: %w", err) }
+	fmt.Printf("--- Contents of '%s' (%s) ---\n", gomFileName, projectGomFile.filePath)
+	fmt.Println(string(jsonData))
+	fmt.Println("-------------------------------------------------")
+	return nil
+}
+
+// --- Environment Variable Handlers ---
+
+// handleEnvAdd adds or updates an environment variable description in gom.json.
+// Usage: gom env add <VAR_NAME> --desc "Description" [--default "Default Value"]
+// Returns (modifiedProjectGom bool, error)
+func handleEnvAdd(args []string) (bool, error) {
+	envCmd := flag.NewFlagSet("env add", flag.ContinueOnError)
+	desc := envCmd.String("desc", "", "Description of the environment variable (required)")
+	defVal := envCmd.String("default", "", "Optional default value")
+
+	if err := envCmd.Parse(args); err != nil {
+		return false, fmt.Errorf("invalid flags. Usage: gom env add <VAR_NAME> --desc \"...\" [--default \"...\"]")
+	}
+	posArgs := envCmd.Args()
+	if len(posArgs) != 1 {
+		return false, fmt.Errorf("usage: gom env add <VAR_NAME> --desc \"...\" [--default \"...\"]")
+	}
+	varName := posArgs[0]
+	if *desc == "" {
+		return false, fmt.Errorf("--desc flag is required")
+	}
+	if strings.ContainsAny(varName, "=@\"' ") { // Basic validation
+		return false, fmt.Errorf("invalid environment variable name: '%s'", varName)
 	}
 
-	dependencies, err := getAllProjectDependencies()
+	info := EnvironmentInfo{
+		Description: *desc,
+		Default:     *defVal,
+	}
+
+	if err := addProjectEnvironment(varName, info); err != nil { // From gomfile.go
+		return false, err
+	}
+	fmt.Printf("Added/Updated environment variable '%s' in '%s'.\n", varName, gomFileName)
+	return true, nil // Mark gom.json as modified
+}
+
+// handleEnvRemove removes an environment variable description from gom.json.
+// Usage: gom env remove <VAR_NAME>
+// Returns (modifiedProjectGom bool, error)
+func handleEnvRemove(args []string) (bool, error) {
+	if len(args) != 1 {
+		return false, fmt.Errorf("usage: gom env remove <VAR_NAME>")
+	}
+	varName := args[0]
+
+	removed, err := removeProjectEnvironment(varName) // From gomfile.go
 	if err != nil {
-		return err // Error reading or accessing dependencies.
+		return false, err
 	}
+	if !removed {
+		fmt.Printf("Environment variable '%s' not found in '%s'.\n", varName, gomFileName)
+		return false, nil // Not modified if not found
+	}
+	fmt.Printf("Removed environment variable '%s' from '%s'.\n", varName, gomFileName)
+	return true, nil // Mark gom.json as modified
+}
 
-	if len(dependencies) == 0 {
-		fmt.Printf("No dependencies found in project's '%s' at %s.\n", gomFileName, projectGomFile.filePath)
+// handleEnvList displays documented environment variables from gom.json.
+func handleEnvList(args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("the 'env list' command does not take any arguments")
+	}
+	envs, err := getAllProjectEnvironments() // From gomfile.go
+	if err != nil {
+		return err
+	}
+	if len(envs) == 0 {
+		fmt.Printf("No environment variables documented in '%s'.\n", gomFileName)
 		return nil
 	}
 
-	// Format and print the dependencies.
-	fmt.Printf("--- Dependencies defined in '%s' (%s) ---\n", gomFileName, projectGomFile.filePath)
-	outputData := map[string]interface{}{"dependencies": dependencies} // Wrap for correct JSON structure.
+	fmt.Printf("--- Environment Variables Documented in '%s' ---\n", gomFileName)
+	// Consider a more formatted output than just JSON? For now, JSON is simple.
+	outputData := map[string]interface{}{"environments": envs}
 	jsonData, err := json.MarshalIndent(outputData, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to format dependencies for display: %w", err)
+		return fmt.Errorf("failed to format environments for display: %w", err)
 	}
 	fmt.Println(string(jsonData))
 	fmt.Println("-------------------------------------------------")
 	return nil
 }
 
-// handleUninstall removes an alias from the project's gom.json file.
-//
-// Usage: gom uninstall <alias>@<version>
-// It validates the alias format and removes the corresponding entry from gom.json.
-// Returns true if the project's gom.json was modified, and any error.
-// Note: Does not run `go mod tidy`.
-func handleUninstall(args []string) (bool, error) {
-    modifiedProjectGom := false
-    if projectGomFile == nil || projectGomFile.filePath == "" {
-         return modifiedProjectGom, fmt.Errorf("could not find '%s' or project root (go.mod). Run 'gom init' first?", gomFileName)
-    }
-
-	if len(args) != 1 {
-		return modifiedProjectGom, fmt.Errorf("the 'uninstall' command requires exactly one argument: <alias>@<version>")
-	}
-	aliasVersion := args[0]
-	packageName, version := parsePackageArg(aliasVersion) // Validate format.
-	if packageName == "" || version == "" { // Version is required.
-		 return modifiedProjectGom, fmt.Errorf("invalid alias format: '%s'. Must be <name>@<version>", aliasVersion)
-	}
-
-	// Attempt to remove the dependency alias.
-	fmt.Printf("-> Removing alias '%s' from project '%s'...\n", aliasVersion, gomFileName)
-	removed, err := removeProjectDependency(aliasVersion) // From gomfile.go
-	if err != nil {
-		return modifiedProjectGom, fmt.Errorf("internal error removing dependency: %w", err)
-	}
-
-	if !removed {
-		fmt.Printf("Alias '%s' not found in '%s'. Nothing to remove.\n", aliasVersion, gomFileName)
-	} else {
-		modifiedProjectGom = true // Mark as modified.
-		fmt.Printf("Successfully removed alias '%s' from '%s'.\n", aliasVersion, gomFileName)
-		fmt.Printf("Note: This only removed the alias. Run 'go mod tidy' manually if the package is no longer needed.\n")
-	}
-
-	return modifiedProjectGom, nil
-}
-
+// --- Cache Handlers ---
 
 // handleCacheList displays the contents of the global alias cache file.
 func handleCacheList(args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("the 'cache list' command does not take any arguments")
-	}
-
-	aliases, err := getAllGlobalCachedAliases() // From cache.go
-	if err != nil {
-		return fmt.Errorf("failed to read global cache: %w", err)
-	}
-
-	cachePath, _ := getGlobalCacheFilePath() // Get path for context.
+	if len(args) > 0 { return fmt.Errorf("usage: gom cache list") }
+	aliases, err := getAllGlobalCachedAliases()
+	if err != nil { return fmt.Errorf("failed to read global cache: %w", err) }
+	cachePath, _ := getGlobalCacheFilePath()
 	if cachePath == "" { cachePath = "platform-specific cache path" }
+	if len(aliases) == 0 { fmt.Printf("Global alias cache is empty (%s).\n", cachePath); return nil }
 
-
-	if len(aliases) == 0 {
-		fmt.Printf("Global cache is empty (%s).\n", cachePath)
-		return nil
-	}
-
-	// Format and print the global cache content.
-	fmt.Printf("--- Global Cache Contents (%s) ---\n", cachePath)
-	outputData := map[string]interface{}{"aliases": aliases} // Wrap for correct JSON structure.
+	fmt.Printf("--- Global Alias Cache Contents (%s) ---\n", cachePath)
+	// Adjust structure for display if cache format changed (it didn't significantly here)
+	outputData := map[string]interface{}{"aliases": aliases} // Assuming cache still stores map directly under "aliases"
 	jsonData, err := json.MarshalIndent(outputData, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to format global cache for display: %w", err)
-	}
+	if err != nil { return fmt.Errorf("failed to format global cache for display: %w", err) }
 	fmt.Println(string(jsonData))
 	fmt.Println("-----------------------------------------")
 	return nil
@@ -322,17 +300,38 @@ func handleCacheList(args []string) error {
 
 // handleCacheClear clears all entries from the global alias cache file.
 func handleCacheClear(args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("the 'cache clear' command does not take any arguments")
-	}
-
+	if len(args) > 0 { return fmt.Errorf("usage: gom cache clear") }
 	fmt.Println("Clearing global cache...")
-	err := clearGlobalCache() // From cache.go
-	if err != nil {
+	if err := clearGlobalCache(); err != nil { // From cache.go
 		return fmt.Errorf("failed to clear global cache: %w", err)
 	}
-	cachePath, _ := getGlobalCacheFilePath() // Get path for context.
+	cachePath, _ := getGlobalCacheFilePath()
 	if cachePath == "" { cachePath = "platform-specific cache path" }
 	fmt.Printf("Global cache cleared (%s).\n", cachePath)
 	return nil
+}
+
+// --- Doctor/Check Handlers ---
+
+// handleCheckGo explicitly runs `go version` and updates the cache.
+// Returns (modifiedGlobalCache bool, error)
+func handleCheckGo(args []string) (bool, error) {
+	if len(args) > 0 { return false, fmt.Errorf("usage: gom check go") }
+
+	fmt.Println("Running `go version` to check installation and update cache...")
+	versionOutput, err := runGoVersion() // From main.go (or move to utils?)
+	if err != nil {
+		return false, err // Error already formatted by runGoVersion
+	}
+
+	fmt.Printf("Found Go version: %s", versionOutput) // Includes newline
+	err = updateGlobalCachedGoVersion(versionOutput) // Update cache
+	if err != nil {
+		// Log warning but don't fail the command
+		fmt.Fprintf(os.Stderr, "Warning: Failed to update Go version in cache: %v\n", err)
+		return false, nil // Cache wasn't successfully modified from its previous state
+	}
+
+	fmt.Println("Go version cache updated.")
+	return true, nil // Cache was modified
 }
