@@ -111,3 +111,9 @@ Contributions welcome! Please open Issues or Pull Requests.
 ## License
 
 MIT License - see `LICENSE` file.
+
+## Downloads / Installation from Binaries
+
+Pre-compiled binaries for Linux, macOS, and Windows are available on the [**Releases Page**](https://github.com/locshino/gom/releases).
+
+Download the appropriate binary for your operating system, place it in a directory included in your system's PATH, and ensure it has execute permissions.
