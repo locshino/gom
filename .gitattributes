@@ -1,0 +1,11 @@
+# Set default behavior, in case users don't have core.autocrlf set.
+* text=auto
+
+# Explicitly declare text files you want to always normalize and convert
+# to LF line endings on commit.
+*.go text
+*.mod text
+*.sum text
+*.json text
+*.md text
+# Add other text file types as needed
